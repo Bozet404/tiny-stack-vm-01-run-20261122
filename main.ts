@@ -1,25 +1,57 @@
-// Tiny stack VM for make.fun tiny-stack-vm-01-run-20261122.
+// Tiny stack VM — make.fun tiny-stack-vm-01-run-20261122.
 // Runs /input/<id>/program.bin + input.bin, writes /output/<id>/stdout.bin
-// and exit.txt. ISA: 32-bit wrapping values, 256-value data stack, 64-deep
-// call stack, 256 memory words, 1,000,000 steps, 65,536 output bytes, ten
-// traps each with its own exit code; a trap keeps the output written before
-// it. Trap checks run in the ISA's order: step limit, pc, unknown opcode,
-// cut-off immediate, stack underflow, stack overflow, then the op's own trap.
+// and exit.txt. 32-bit wrapping values, 256-slot data stack, 64-deep call
+// stack, 256 memory words, 1,000,000 steps, 65,536 output bytes, ten traps
+// each with its own exit code; output written before a trap is kept. Checks
+// run in ISA order: step limit, pc, unknown opcode, cut-off immediate,
+// underflow, overflow, then the opcode's own trap.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // Per opcode: [immediate bytes, values popped, values pushed].
-const T: [number, number, number][] = [];
+const SPEC: [number, number, number][] = [];
 for (const [o, i, p, q] of [
-  [0, 0, 0, 0], [1, 1, 0, 1], [2, 4, 0, 1], [3, 0, 1, 0], [4, 0, 1, 2],
-  [5, 0, 2, 2], [6, 0, 2, 3], [7, 0, 3, 3], [16, 0, 2, 1], [17, 0, 2, 1],
-  [18, 0, 2, 1], [19, 0, 2, 1], [20, 0, 2, 1], [21, 0, 2, 1], [22, 0, 2, 1],
-  [23, 0, 1, 1], [24, 0, 2, 1], [25, 0, 2, 1], [26, 0, 2, 1], [27, 0, 1, 1],
-  [28, 0, 2, 1], [29, 0, 2, 1], [30, 0, 2, 1], [32, 0, 2, 1], [33, 0, 2, 1],
-  [34, 0, 2, 1], [48, 2, 0, 0], [49, 2, 1, 0], [50, 2, 1, 0], [51, 2, 0, 0],
-  [52, 0, 0, 0], [64, 0, 1, 1], [65, 0, 2, 0], [80, 0, 1, 0], [81, 0, 1, 0],
-  [82, 0, 0, 1], [83, 0, 1, 0],
-]) T[o] = [i, p, q];
+  [0x00, 0, 0, 0], [0x01, 1, 0, 1], [0x02, 4, 0, 1], [0x03, 0, 1, 0],
+  [0x04, 0, 1, 2], [0x05, 0, 2, 2], [0x06, 0, 2, 3], [0x07, 0, 3, 3],
+  [0x10, 0, 2, 1], [0x11, 0, 2, 1], [0x12, 0, 2, 1], [0x13, 0, 2, 1],
+  [0x14, 0, 2, 1], [0x15, 0, 2, 1], [0x16, 0, 2, 1], [0x17, 0, 1, 1],
+  [0x18, 0, 2, 1], [0x19, 0, 2, 1], [0x1a, 0, 2, 1], [0x1b, 0, 1, 1],
+  [0x1c, 0, 2, 1], [0x1d, 0, 2, 1], [0x1e, 0, 2, 1], [0x20, 0, 2, 1],
+  [0x21, 0, 2, 1], [0x22, 0, 2, 1], [0x30, 2, 0, 0], [0x31, 2, 1, 0],
+  [0x32, 2, 1, 0], [0x33, 2, 0, 0], [0x34, 0, 0, 0], [0x40, 0, 1, 1],
+  [0x41, 0, 2, 0], [0x50, 0, 1, 0], [0x51, 0, 1, 0], [0x52, 0, 0, 1],
+  [0x53, 0, 1, 0],
+]) SPEC[o] = [i, p, q];
+
+// Two-operand op; null only for division by zero (trap 4).
+function bin(op: number, a: number, b: number): number | null {
+  switch (op) {
+    case 0x10: return (a + b) | 0;
+    case 0x11: return (a - b) | 0;
+    case 0x12: return Math.imul(a, b);
+    case 0x13:
+      if (b === 0) return null;
+      return a === -2147483648 && b === -1 ? a : (a / b) | 0;
+    case 0x14:
+      if (b === 0) return null;
+      return b === -1 ? 0 : (a % b) | 0;
+    case 0x15:
+      if (b === 0) return null;
+      return Math.floor((a >>> 0) / (b >>> 0)) | 0;
+    case 0x16:
+      if (b === 0) return null;
+      return ((a >>> 0) % (b >>> 0)) | 0;
+    case 0x18: return a & b;
+    case 0x19: return a | b;
+    case 0x1a: return a ^ b;
+    case 0x1c: return a << (b & 31);
+    case 0x1d: return a >> (b & 31);
+    case 0x1e: return (a >>> (b & 31)) | 0;
+    case 0x20: return a === b ? 1 : 0;
+    case 0x21: return a < b ? 1 : 0;
+    default: return (a >>> 0) < (b >>> 0) ? 1 : 0; // 0x22 LTU
+  }
+}
 
 function run(prog: Uint8Array, input: Uint8Array): { out: Uint8Array; code: number } {
   const n = prog.length;
@@ -39,13 +71,13 @@ function run(prog: Uint8Array, input: Uint8Array): { out: Uint8Array; code: numb
     if (steps === 1000000) return done(10);
     if (pc < 0 || pc >= n) return done(9);
     const op = prog[pc];
-    const m = T[op];
-    if (m === undefined) return done(5);
-    if (pc + m[0] >= n) return done(9);
+    const s = SPEC[op];
+    if (s === undefined) return done(5);
+    if (pc + s[0] >= n) return done(9);
     steps++;
-    const nx = pc + 1 + m[0];
-    if (sp < m[1]) return done(2);
-    if (sp - m[1] + m[2] > 256) return done(3);
+    const nx = pc + 1 + s[0];
+    if (sp < s[1]) return done(2);
+    if (sp - s[1] + s[2] > 256) return done(3);
     pc = nx;
     switch (op) {
       case 0x00: return done(0);
@@ -68,31 +100,8 @@ function run(prog: Uint8Array, input: Uint8Array): { out: Uint8Array; code: numb
       case 0x20: case 0x21: case 0x22: {
         const b = st[sp - 1];
         const a = st[sp - 2];
-        let r: number;
-        if (op === 0x10) r = (a + b) | 0;
-        else if (op === 0x11) r = (a - b) | 0;
-        else if (op === 0x12) r = Math.imul(a, b);
-        else if (op === 0x13) {
-          if (b === 0) return done(4);
-          r = a === -2147483648 && b === -1 ? a : (a / b) | 0;
-        } else if (op === 0x14) {
-          if (b === 0) return done(4);
-          r = b === -1 ? 0 : (a % b) | 0;
-        } else if (op === 0x15) {
-          if (b === 0) return done(4);
-          r = Math.floor((a >>> 0) / (b >>> 0)) | 0;
-        } else if (op === 0x16) {
-          if (b === 0) return done(4);
-          r = ((a >>> 0) % (b >>> 0)) | 0;
-        } else if (op === 0x18) r = a & b;
-        else if (op === 0x19) r = a | b;
-        else if (op === 0x1a) r = a ^ b;
-        else if (op === 0x1c) r = a << (b & 31);
-        else if (op === 0x1d) r = a >> (b & 31);
-        else if (op === 0x1e) r = (a >>> (b & 31)) | 0;
-        else if (op === 0x20) r = a === b ? 1 : 0;
-        else if (op === 0x21) r = a < b ? 1 : 0;
-        else r = a >>> 0 < (b >>> 0) ? 1 : 0;
+        const r = bin(op, a, b);
+        if (r === null) return done(4);
         sp -= 2;
         st[sp++] = r;
         break;
